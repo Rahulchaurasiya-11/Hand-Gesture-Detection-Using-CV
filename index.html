@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Gesture Recognition — RMR Team</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{--accent:#00b894;--bg:#0f1720;--panel:#0b1220}
+
+    body{margin:0;background:linear-gradient(180deg,#071021 0%, #091925 100%);color:#e6eef6;font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;display:flex;flex-direction:column;align-items:center;min-height:100vh}
+    .topbar{width:100%;padding:10px 16px;box-sizing:border-box;display:flex;justify-content:center;align-items:center}
+    .team{font-weight:700;color:#fff;background:rgba(0,0,0,0.25);padding:8px 16px;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,0.4)}
+    .container{margin-top:6px;padding:14px;border-radius:12px;background:rgba(255,255,255,0.03);width:940px;max-width:96%;box-shadow:0 8px 30px rgba(2,6,23,0.6)}
+    .row{display:flex;gap:12px;align-items:flex-start}
+    video{display:block;border-radius:10px;transform:scaleX(-1)} /* mirror preview */
+    canvas{position:absolute;left:0;top:0;pointer-events:none}
+    .stage{position:relative;width:840px;max-width:78vw;height:560px;background:#000;border-radius:10px;overflow:hidden;display:flex;align-items:center;justify-content:center}
+    .controls{display:flex;flex-direction:column;gap:8px;padding:8px}
+    button{background:var(--accent);border:none;padding:10px 14px;border-radius:8px;color:#072023;font-weight:700;cursor:pointer}
+    .label{margin-top:8px;font-size:18px;font-weight:600}
+    .info{font-size:13px;color:#bcd6e8;margin-top:8px}
+    .badge{position:absolute;left:50%;transform:translateX(-50%);top:8px;background:rgba(0,0,0,0.45);padding:6px 12px;border-radius:8px;font-weight:700}
+    .gestureBox{position:absolute;left:10px;bottom:10px;background:rgba(0,0,0,0.5);padding:8px 12px;border-radius:8px;font-weight:700}
+  </style>
+  
+</head>
+<body>
+
+  <div class="topbar">
+    <div class="team">Team Name: RMR Team</div>
+  </div>
+
+  <div class="container">
+    <div class="row">
+      <div class="stage" id="stage">
+        <div style="position:relative; width:100%; height:100%;">
+          <video id="video" width="100%" height="100%" playsinline></video>
+          <canvas id="canvas"></canvas>
+          <div class="badge" id="statusBadge">Not running</div>
+          <div class="gestureBox" id="gestureBox">Gesture: —</div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button id="startBtn">Start Camera</button>
+        <button id="stopBtn" disabled>Stop</button>
+
+        <div class="label">Detected:</div>
+        <div id="detectedList">—</div>
+
+        <div class="info">
+          Tip: Use clear hand gestures in front of camera. The app supports single-hand numbers (1–5) and two-hand totals (6–10). Also detects Fist, Thumbs Up (Yes), Victory (Best of Luck), OK, Open Palm (Hello/Stop).
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mediapipe libs -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+  <script>
+  // helper functions
+  const dist = (a,b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+  // simple heuristics (normalized coords)
+  function isFist(landmarks){
+    const wrist = landmarks[0];
+    const tips = [4,8,12,16,20].map(i => landmarks[i]);
+    const dists = tips.map(t => dist(t, wrist));
+    return Math.max(...dists) < 0.08;
+  }
+
+  function isThumbsUp(landmarks){
+    const wrist = landmarks[0];
+    const thumbTip = landmarks[4];
+    const indexMCP = landmarks[5];
+    return (thumbTip.y < wrist.y) && (dist(thumbTip, indexMCP) > 0.06);
+  }
+
+  function isOpenPalm(landmarks){
+    const wrist = landmarks[0];
+    const tips = [4,8,12,16,20].map(i => landmarks[i]);
+    const dists = tips.map(t => dist(t, wrist));
+    return Math.min(...dists) > 0.12;
+  }
+
+  function isVictory(landmarks){
+    const wrist = landmarks[0];
+    const indexTip = landmarks[8], middleTip = landmarks[12];
+    const ringTip = landmarks[16], pinkyTip = landmarks[20];
+    const cond1 = dist(indexTip,wrist) > 0.12 && dist(middleTip,wrist) > 0.12;
+    const cond2 = dist(ringTip,wrist) < 0.09 && dist(pinkyTip,wrist) < 0.09;
+    return cond1 && cond2;
+  }
+
+  function isOK(landmarks){
+    const thumbTip = landmarks[4], indexTip = landmarks[8];
+    return dist(thumbTip, indexTip) < 0.05;
+  }
+
+  function countFingersSingleHand(landmarks){
+    // returns 0..5 (thumb detection approximate)
+    let count = 0;
+    // fingers: index(8), middle(12), ring(16), pinky(20)
+    [8,12,16,20].forEach(tip => {
+      // tip is above pip (tip.y < pip.y)
+      if(landmarks[tip].y < landmarks[tip-2].y) count++;
+    });
+    // thumb: check horizontal relative to IP joints
+    if(landmarks[4].x < landmarks[3].x) count++; // mirrored view used
+    return count;
+  }
+
+  // page elements
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const statusBadge = document.getElementById('statusBadge');
+  const gestureBox = document.getElementById('gestureBox');
+  const detectedList = document.getElementById('detectedList');
+
+  let camera = null;
+  let running = false;
+  let lastLabel = '—';
+
+  // Mediapipe hands setup
+  const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.5
+  });
+
+  hands.onResults(onResults);
+
+  async function startCamera(){
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    statusBadge.textContent = 'Starting...';
+    try{
+      // use Camera util from mediapipe
+      camera = new Camera(video, {
+        onFrame: async () => {
+          await hands.send({image: video});
+        },
+        width: 1280,
+        height: 720
+      });
+      camera.start();
+      running = true;
+      statusBadge.textContent = 'Running';
+    } catch (e) {
+      console.error(e);
+      statusBadge.textContent = 'Camera error';
+      startBtn.disabled = false;
+    }
+  }
+
+  function stopCamera(){
+    if(camera) camera.stop();
+    running = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    statusBadge.textContent = 'Stopped';
+    gestureBox.textContent = 'Gesture: —';
+    detectedList.textContent = '—';
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+  }
+
+  function onResults(results){
+    // fit canvas to video
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    // draw mirrored video frame onto canvas as background (optional)
+    ctx.save();
+    ctx.scale(-1,1);
+    ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
+    ctx.restore();
+
+    // draw team name top center (overlay)
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.fillRect(canvas.width/2 - 160, 8, 320, 36);
+    ctx.fillStyle = '#fff';
+    ctx.font = '18px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('Team Name: RMR Team', canvas.width/2, 32);
+
+    let label = 'No hand';
+    let detected = [];
+
+    if(results.multiHandLandmarks && results.multiHandLandmarks.length > 0){
+      // for each hand draw landmarks
+      for(let h=0; h<results.multiHandLandmarks.length; h++){
+        const landmarks = results.multiHandLandmarks[h];
+
+        // draw connections & points using mediapipe drawing utils
+        drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+        drawLandmarks(ctx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 2});
+
+        // convert landmarks into array of {x,y} in normalized coords
+        const lm = landmarks.map(p => ({x: p.x, y: p.y, z: p.z}));
+
+        // per-hand gestures & counts
+        if(isFist(lm)) detected.push('Fist');
+        else if(isThumbsUp(lm)) detected.push('Thumbs Up');
+        else if(isVictory(lm)) detected.push('Victory');
+        else if(isOpenPalm(lm)) detected.push('Open Palm');
+        else if(isOK(lm)) detected.push('OK');
+        else {
+          const cnt = countFingersSingleHand(lm);
+          if(cnt >= 0) detected.push(String(cnt));
+        }
+      }
+
+      // If two hands present and both show numbers, sum them to allow 6-10
+      if(results.multiHandLandmarks.length === 2){
+        // try to parse numeric entries and sum
+        const nums = detected.map(x => parseInt(x)).filter(x => !isNaN(x));
+        if(nums.length === 2){
+          const s = nums[0] + nums[1];
+          label = `Number: ${s}`;
+        } else {
+          label = detected.join(' | ');
+        }
+      } else {
+        label = detected[0] || 'Unknown';
+        // If single-hand numeric string set nicely
+        if(!isNaN(parseInt(label))) label = `Number: ${label}`;
+      }
+    }
+
+    // display gesture label
+    gestureBox.textContent = `Gesture: ${label}`;
+    detectedList.textContent = `${detected.join(', ') || '—'}`;
+
+    // small footer
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(8, canvas.height - 38, 240, 30);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'left';
+    ctx.font = '14px Arial';
+    ctx.fillText(`Gesture: ${label}`, 14, canvas.height - 16);
+  }
+
+  // wire buttons
+  startBtn.addEventListener('click', ()=> startCamera());
+  stopBtn.addEventListener('click', ()=> stopCamera());
+
+  // auto resize stage to fit video size
+  video.addEventListener('loadedmetadata', () => {
+    const stage = document.getElementById('stage');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  });
+  </script>
+</body>
+</html>
